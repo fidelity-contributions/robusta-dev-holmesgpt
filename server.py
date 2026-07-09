@@ -11,6 +11,7 @@ if add_custom_certificate(ADDITIONAL_CERTIFICATE):
 # IMPORTING ABOVE MIGHT INITIALIZE AN HTTPS CLIENT THAT DOESN'T TRUST THE CUSTOM CERTIFICATE
 import json
 import logging
+import ssl
 import threading
 import time
 from datetime import datetime
@@ -37,6 +38,10 @@ from holmes.common.env_vars import (
     ENABLED_SCHEDULED_PROMPTS,
     HOLMES_HOST,
     HOLMES_PORT,
+    HOLMES_SSL_CA_CERTS,
+    HOLMES_SSL_CERTFILE,
+    HOLMES_SSL_KEYFILE,
+    HOLMES_SSL_KEYFILE_PASSWORD,
     LOG_PERFORMANCE,
     MCP_RETRY_BACKOFF_SCHEDULE,
     SENTRY_DSN,
@@ -854,8 +859,64 @@ def readiness_check():
         raise HTTPException(status_code=503, detail="Service not ready")
 
 
+def build_ssl_kwargs() -> dict:
+    """Build uvicorn ssl_* kwargs from the HOLMES_SSL_* env vars.
+
+    Returns an empty dict (plain HTTP) when no TLS config is provided. When TLS is
+    configured we fail fast on partial/invalid config rather than silently serving
+    HTTP, since a misconfiguration that downgrades to plaintext is a security risk.
+    """
+    cert, key = HOLMES_SSL_CERTFILE, HOLMES_SSL_KEYFILE
+    if not cert and not key:
+        # No server cert/key means plain HTTP. But if the user supplied mTLS or
+        # key-password settings they intended TLS, so fail rather than silently
+        # serving plaintext and ignoring those settings.
+        if HOLMES_SSL_CA_CERTS or HOLMES_SSL_KEYFILE_PASSWORD:
+            raise SystemExit(
+                "TLS misconfigured: HOLMES_SSL_CA_CERTS / HOLMES_SSL_KEYFILE_PASSWORD "
+                "require HOLMES_SSL_CERTFILE and HOLMES_SSL_KEYFILE to be set."
+            )
+        return {}  # HTTP mode
+
+    if bool(cert) != bool(key):
+        raise SystemExit(
+            "TLS misconfigured: set BOTH HOLMES_SSL_CERTFILE and HOLMES_SSL_KEYFILE (or neither)."
+        )
+
+    def _require_readable(label: str, path: str) -> None:
+        # is_file() alone only proves the path exists; an unreadable file (e.g.
+        # wrong permissions on a mounted secret) would pass that check and then
+        # fail later inside uvicorn.run, after the slow pre-start sync we're
+        # trying to run behind this fail-fast. Opening it now catches both cases
+        # (FileNotFoundError, IsADirectoryError and PermissionError are all OSError).
+        try:
+            with Path(path).open("rb"):
+                pass
+        except OSError:
+            raise SystemExit(
+                f"TLS misconfigured: {label}={path!r} not found or unreadable."
+            ) from None
+
+    _require_readable("HOLMES_SSL_CERTFILE", cert)
+    _require_readable("HOLMES_SSL_KEYFILE", key)
+
+    kwargs: dict = {"ssl_certfile": cert, "ssl_keyfile": key}
+    if HOLMES_SSL_KEYFILE_PASSWORD:
+        kwargs["ssl_keyfile_password"] = HOLMES_SSL_KEYFILE_PASSWORD
+    if HOLMES_SSL_CA_CERTS:  # mTLS: require & verify client certificates
+        _require_readable("HOLMES_SSL_CA_CERTS", HOLMES_SSL_CA_CERTS)
+        kwargs["ssl_ca_certs"] = HOLMES_SSL_CA_CERTS
+        kwargs["ssl_cert_reqs"] = ssl.CERT_REQUIRED
+    return kwargs
+
+
 def main():
     """Holmes AI Server entry point"""
+    # Resolve TLS config up front so a misconfiguration fails fast, before the
+    # (potentially slow) pre-start sync below.
+    ssl_kwargs = build_ssl_kwargs()
+    scheme = "HTTPS" if ssl_kwargs else "HTTP"
+
     # Configure uvicorn logging
     log_config = uvicorn.config.LOGGING_CONFIG
     log_config["formatters"]["access"]["fmt"] = (
@@ -870,7 +931,10 @@ def main():
     _toolset_status_refresh_loop()
 
     # Start server
-    uvicorn.run(app, host=HOLMES_HOST, port=HOLMES_PORT, log_config=log_config)
+    logging.info(f"Holmes API serving {scheme} on {HOLMES_HOST}:{HOLMES_PORT}")
+    uvicorn.run(
+        app, host=HOLMES_HOST, port=HOLMES_PORT, log_config=log_config, **ssl_kwargs
+    )
 
 
 if __name__ == "__main__":

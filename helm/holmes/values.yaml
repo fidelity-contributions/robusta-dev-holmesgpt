@@ -1,6 +1,21 @@
 certificate: "" # base64 encoded
 logLevel: INFO
 
+# Serve the Holmes API over HTTPS directly from the pod (in-app TLS, no ingress/proxy).
+# When enabled you must provide your own TLS secret via secretName (e.g. issued by
+# cert-manager or created manually); the chart does not generate a self-signed cert.
+tls:
+  enabled: false
+  # Name of a kubernetes.io/tls (or generic) secret containing tls.crt and tls.key.
+  secretName: ""
+  # Optional: key within secretName holding the password for an encrypted private
+  # key (tls.key). Sourced via secretKeyRef so the password is not stored in the
+  # pod spec in plaintext.
+  keyfilePasswordSecretKey: ""
+  # Optional: key within the same secret holding a CA bundle. When set, mTLS is
+  # enabled and the server requires & verifies client certificates.
+  caCertsSecretKey: ""
+
 additionalEnvVars: []
 additional_env_vars: []
 # Mirrors runner.additional_env_froms: a list of envFrom entries (secretRef /
